@@ -1,0 +1,17 @@
+services:
+	- docker
+language: bash
+env:
+  global:
+    - GOSU_VERSION="1.10"
+    - DOCKER_REPO="alexadhy/rpi-postgresql-alpine"
+    - DOCKER_TAG=$(grep "postgresql==" Dockerfile | sed 's/.*=//' | sed 's/-r.*//')
+script:
+    # build image
+    - docker build -t "$DOCKER_REPO":build .
+    # test image
+    - docker run "$DOCKER_REPO":build psql --version
+    # push image
+    - docker login -u "$DOCKER_USER" -p "$DOCKER_PASS"
+    - docker tag "$DOCKER_REPO":build "$DOCKER_REPO":"$DOCKER_TAG"
+    - docker push "$DOCKER_REPO":"$DOCKER_TAG"
