@@ -1,28 +1,7 @@
 #!/bin/bash
 set -e
 
-# usage: file_env VAR [DEFAULT]
-#    ie: file_env 'XYZ_DB_PASSWORD' 'example'
-# (will allow for "$XYZ_DB_PASSWORD_FILE" to fill in the value of
-#  "$XYZ_DB_PASSWORD" from a file, especially for Docker's secrets feature)
-file_env() {
-	local var="$1"
-	local fileVar="${var}_FILE"
-	local def="${2:-}"
-	if [ "${!var:-}" ] && [ "${!fileVar:-}" ]; then
-		echo >&2 "error: both $var and $fileVar are set (but are exclusive)"
-		exit 1
-	fi
-	local val="$def"
-	if [ "${!var:-}" ]; then
-		val="${!var}"
-	elif [ "${!fileVar:-}" ]; then
-		val="$(< "${!fileVar}")"
-	fi
-	export "$var"="$val"
-	unset "$fileVar"
-}
-
+# upgrade packages if UPGRADE_ON_START is set
 if [ ! -z ${UPGRADE_ON_START+x} ]; then
     apk upgrade --no-cache 
 fi
@@ -31,32 +10,19 @@ if [ "${1:0:1}" = '-' ]; then
 	set -- postgres "$@"
 fi
 
-# allow the container to be started with `--user`
-if [ "$1" = 'postgres' ] && [ "$(id -u)" = '0' ]; then
-	mkdir -p "$PGDATA"
-	chown -R postgres "$PGDATA"
-	chmod 700 "$PGDATA"
-
-	mkdir -p /var/run/postgresql
-	chown -R postgres /var/run/postgresql
-	chmod g+s /var/run/postgresql
-
-	exec gosu postgres "$BASH_SOURCE" "$@"
-fi
-
 if [ "$1" = 'postgres' ]; then
 	mkdir -p "$PGDATA"
-	chown -R "$(id -u)" "$PGDATA" 2>/dev/null || :
-	chmod 700 "$PGDATA" 2>/dev/null || :
+	chmod 700 "$PGDATA"
+	chmod o+x /
+	chmod o+wr /tmp
+	chown -R postgres "$PGDATA"
 
 	# look specifically for PG_VERSION, as it is expected in the DB dir
 	if [ ! -s "$PGDATA/PG_VERSION" ]; then
-		file_env 'POSTGRES_INITDB_ARGS'
-		eval "initdb --username=postgres $POSTGRES_INITDB_ARGS"
+		su -c "initdb $POSTGRES_INITDB_ARGS" postgres
 
 		# check password first so we can output the warning before postgres
 		# messes it up
-		file_env 'POSTGRES_PASSWORD'
 		if [ "$POSTGRES_PASSWORD" ]; then
 			pass="PASSWORD '$POSTGRES_PASSWORD'"
 			authMethod=md5
@@ -79,17 +45,17 @@ if [ "$1" = 'postgres' ]; then
 			authMethod=trust
 		fi
 
-		{ echo; echo "host all all all $authMethod"; } | tee -a "$PGDATA/pg_hba.conf" > /dev/null
+		{ echo; echo "host all all 0.0.0.0/0 $authMethod"; } >> "$PGDATA/pg_hba.conf"
 
 		# internal start of server in order to allow set-up using psql-client		
 		# does not listen on external TCP/IP and waits until start finishes
-		PGUSER="${PGUSER:-postgres}" \
-		pg_ctl -D "$PGDATA" \
+		su -c 'pg_ctl -D "$PGDATA" \
 			-o "-c listen_addresses='localhost'" \
-			-w start
+			-w start' postgres
 
-		file_env 'POSTGRES_USER' 'postgres'
-		file_env 'POSTGRES_DB' "$POSTGRES_USER"
+		: ${POSTGRES_USER:=postgres}
+		: ${POSTGRES_DB:=$POSTGRES_USER}
+		export POSTGRES_USER POSTGRES_DB
 
 		psql=( psql -v ON_ERROR_STOP=1 )
 
@@ -116,20 +82,23 @@ if [ "$1" = 'postgres' ]; then
 		for f in /docker-entrypoint-initdb.d/*; do
 			case "$f" in
 				*.sh)     echo "$0: running $f"; . "$f" ;;
-				*.sql)    echo "$0: running $f"; "${psql[@]}" -f "$f"; echo ;;
+				*.sql)    echo "$0: running $f"; "${psql[@]}" < "$f"; echo ;;
 				*.sql.gz) echo "$0: running $f"; gunzip -c "$f" | "${psql[@]}"; echo ;;
 				*)        echo "$0: ignoring $f" ;;
 			esac
 			echo
 		done
 
-		PGUSER="${PGUSER:-postgres}" \
-		pg_ctl -D "$PGDATA" -m fast -w stop
+                echo -e "listen_addresses = '*'\nport = 5432" >> $PGDATA/postgresql.conf
+
+		su -c 'pg_ctl -D "$PGDATA" -m fast -w stop' postgres
 
 		echo
 		echo 'PostgreSQL init process complete; ready for start up.'
 		echo
 	fi
+
+	exec su -c "$@" postgres
 fi
 
 exec "$@"
